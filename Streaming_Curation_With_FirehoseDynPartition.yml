@@ -1,0 +1,517 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Curating Change data capture (CDC) data on the fly using Amazon Kinesis Data Firehose Dynamic Partitioning
+Resources:
+  # Curated bucket to store data delivered by Firehose
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: TRUE
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Kinesis data stream to ingest data from multiple data sources
+  KinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 2
+      StreamEncryption:
+          EncryptionType: KMS
+          KeyId: alias/aws/kinesis
+
+  # Kinesis read role for Firehose to read kinesis stream
+  FirehoseKinesisReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: FirehoseKinesisRead
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource:
+                  - !GetAtt KinesisDataStream.Arn
+
+  # S3 Write role for Firehose to write curated data
+  FirehoseS3WriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: FirehoseS3Write
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CuratedBucket.Arn
+                  - !Sub "${CuratedBucket.Arn}/*"
+                  - !GetAtt RecordTransformer.Arn
+
+  # Firehose delivery stream
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt KinesisDataStream.Arn
+        RoleARN: !GetAtt FirehoseKinesisReadRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt CuratedBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 128
+        CompressionFormat: GZIP
+        ErrorOutputPrefix: errors/
+        Prefix: "table=!{partitionKeyFromLambda:table}/version=!{partitionKeyFromQuery:version}/year=!{partitionKeyFromLambda:year}/month=!{partitionKeyFromLambda:month}/day=!{partitionKeyFromLambda:day}/"
+        RoleARN: !GetAtt FirehoseS3WriteRole.Arn
+        DynamicPartitioningConfiguration:
+          RetryOptions:
+            DurationInSeconds: 60
+          Enabled: TRUE
+        ProcessingConfiguration:
+          Enabled: TRUE
+          Processors:
+            - Type: "Lambda"
+              Parameters:
+                - ParameterName: "LambdaArn"
+                  ParameterValue: !GetAtt RecordTransformer.Arn
+                - ParameterName: "BufferSizeInMBs"
+                  ParameterValue: "3"
+                - ParameterName: "BufferIntervalInSeconds"
+                  ParameterValue: "60"
+            - Type: "MetadataExtraction"
+              Parameters:
+                - ParameterName: "MetadataExtractionQuery"
+                  ParameterValue: "{version:.version}"
+                - ParameterName: "JsonParsingEngine"
+                  ParameterValue: "JQ-1.6"
+
+
+  # Lambda trigger cloudwatch event rule
+  ScheduledEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch event to trigger lambda function acting as datasource
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - DataGeneratorLambda
+              - Arn
+          Id: LambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+          - DataGeneratorLambda
+          - Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+          - ScheduledEvent
+          - Arn
+
+  TransformerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: LogAccessForLambda
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  DataGenLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: KinesisWriteAccessForLambda
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecords
+                Resource:
+                  - !GetAtt KinesisDataStream.Arn
+
+  DataGeneratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import uuid
+          import random
+          import json
+          import time
+
+          client = boto3.client("kinesis")
+          stream_name = os.environ["KinesisStreamName"]
+
+          def publish_records():
+              records = []
+
+              # Data source 1 transaction data version 1
+              tx_old = {"version": 1, "txid":str(random.randrange(1,101)), "amount": random.random() * 100}
+              records.append({'Data':bytes(json.dumps(tx_old),'utf-8'), 'PartitionKey': uuid.uuid4().hex})
+
+              # Data source 1 transaction data version 2: txid renamed to transactionId & new source field added
+              tx_new = {"version": 2, "transactionId":str(random.randrange(1,101)), "amount": random.random() * 100, "source": random.choice(['Web', 'Mobile', 'Store'])}
+              records.append({'Data':bytes(json.dumps(tx_new),'utf-8'), 'PartitionKey': uuid.uuid4().hex})
+
+              # Data source 2: Change data capture (CDC) use case. Pushing multiple table data to same stream
+              table_1 = {"version": 1, "table":"Customer", "data":{"id": random.randrange(1,5),"name": random.choice(["John","Carlos","Mary","Nikki","Richard"]), "country": random.choice(["US","UK"])}}
+              records.append({'Data':bytes(json.dumps(table_1),'utf-8'), 'PartitionKey': uuid.uuid4().hex})
+
+              table_2 = {"version": 1, "table":"Order", "data":{"id": random.randrange(1,501), "customerId":random.randrange(1,5), "qty":random.randrange(1,5), "product":{"name":"Book "+str(random.randrange(1,500)), "price": random.uniform(10.0, 50.0)}  }}
+              records.append({'Data':bytes(json.dumps(table_2),'utf-8'), 'PartitionKey': uuid.uuid4().hex})
+
+              print(tx_old)
+              print(tx_new)
+              print(table_1)
+              print(table_2)
+              client.put_records(Records=records, StreamName=stream_name)
+
+          def lambda_handler(event, context):
+              for i in range(10):
+                  publish_records()
+                  time.sleep(3)
+
+      Handler: index.lambda_handler
+      Role: !GetAtt DataGenLambdaRole.Arn
+      Environment:
+        Variables:
+          KinesisStreamName: !Ref KinesisDataStream
+      Runtime: python3.8
+      Timeout: 60
+
+  RecordTransformer:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import base64
+          import json
+          import datetime
+
+          # Signature for all Lambda functions that user must implement
+          def lambda_handler(firehose_records_input, context):
+
+              # Create return value.
+              firehose_records_output = {'records': []}
+
+
+              for firehose_record_input in firehose_records_input['records']:
+                  # Get user payload
+                  payload = base64.b64decode(firehose_record_input['data'])
+                  json_value = json.loads(payload)
+
+
+                  # Create output Firehose record and add modified payload and record ID to it.
+                  firehose_record_output = {}
+
+                  table = "Transaction"
+                  if "table" in json_value:
+                      table = json_value["table"]
+
+                  now = datetime.datetime.now()
+                  partition_keys = {"table": table, "year": str(now.year), "month": str(now.month), "day": str(now.day)}
+
+                  # Create output Firehose record and add modified payload and record ID to it.
+                  firehose_record_output = {'recordId': firehose_record_input['recordId'],
+                                            'data': firehose_record_input['data'],
+                                            'result': 'Ok',
+                                            'metadata': { 'partitionKeys': partition_keys }}
+
+                  # Must set proper record ID
+                  # Add the record to the list of output records.
+
+                  firehose_records_output['records'].append(firehose_record_output)
+
+              # At the end return processed records
+              return firehose_records_output
+
+      Handler: index.lambda_handler
+      Role: !GetAtt TransformerLambdaRole.Arn
+      Runtime: python3.8
+      Timeout: 120
+
+  # Glue catalog tables for Athena query
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: The blog post glue database
+        Name:
+          Fn::Join:
+            - ""
+            - Fn::Split:
+                - "-"
+                - !Ref AWS::StackName
+
+  TransactionsV1Table:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Description: Transaction table v1 from CDC
+        Name: transactions_v1
+        Parameters: { "classification": "json","compressionType": "gzip", "typeOfData": "file" }
+        PartitionKeys:
+          - Name: "year"
+            Type: "int"
+          - Name: "month"
+            Type: "int"
+          - Name: "day"
+            Type: "int"
+        StorageDescriptor:
+          Columns:
+            - Name: "version"
+              Type: "int"
+            - Name: "txid"
+              Type: "string"
+            - Name: "amount"
+              Type: "double"
+          Location: !Sub "s3://${CuratedBucket}/table=Transaction/version=1/"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Compressed: TRUE
+          SerdeInfo:
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+            Parameters: { "paths": "amount,txid,version" }
+        TableType: "EXTERNAL_TABLE"
+
+  TransactionsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Description: Transaction table v2 (latest) from CDC
+        Name: transactions
+        Parameters: { "classification": "json","compressionType": "gzip", "typeOfData": "file" }
+        PartitionKeys:
+          - Name: "year"
+            Type: "int"
+          - Name: "month"
+            Type: "int"
+          - Name: "day"
+            Type: "int"
+        StorageDescriptor:
+          Columns:
+            - Name: "version"
+              Type: "int"
+            - Name: "transactionid"
+              Type: "string"
+            - Name: "amount"
+              Type: "double"
+            - Name: "source"
+              Type: "string"
+          Location: !Sub "s3://${CuratedBucket}/table=Transaction/version=2/"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Compressed: TRUE
+          SerdeInfo:
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+            Parameters: { "paths": "amount,source,transactionId,version" }
+        TableType: "EXTERNAL_TABLE"
+
+  CustomersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Description: Customers table v1 (latest) from CDC
+        Name: customers
+        Parameters: { "classification": "json","compressionType": "gzip", "typeOfData": "file" }
+        PartitionKeys:
+          - Name: "year"
+            Type: "int"
+          - Name: "month"
+            Type: "int"
+          - Name: "day"
+            Type: "int"
+        StorageDescriptor:
+          Columns:
+            - Name: "version"
+              Type: "int"
+            - Name: "table"
+              Type: "string"
+            - Name: "data"
+              Type: "struct<id:int,name:string,country:string>"
+          Location: !Sub "s3://${CuratedBucket}/table=Customer/version=1/"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Compressed: TRUE
+          SerdeInfo:
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+            Parameters: { "paths": "data,table,version" }
+        TableType: "EXTERNAL_TABLE"
+  OrdersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Description: Orders table v1 (latest) from CDC
+        Name: orders
+        Parameters: { "classification": "json","compressionType": "gzip", "typeOfData": "file" }
+        PartitionKeys:
+          - Name: "year"
+            Type: "int"
+          - Name: "month"
+            Type: "int"
+          - Name: "day"
+            Type: "int"
+        StorageDescriptor:
+          Columns:
+            - Name: "version"
+              Type: "int"
+            - Name: "table"
+              Type: "string"
+            - Name: "data"
+              Type: "struct<id:int,customerId:int,qty:int,product:struct<name:string,price:double>>"
+          Location: !Sub "s3://${CuratedBucket}/table=Order/version=1/"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Compressed: TRUE
+          SerdeInfo:
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+            Parameters: { "paths": "data,table,version" }
+        TableType: "EXTERNAL_TABLE"
+
+  # Athena sample queries
+  QueryTransactions:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: Query new transactions CDC
+      QueryString: !Sub 'select * from "${GlueDatabase}".transactions limit 10'
+      Name: Blog - Query New Transactions
+
+  QueryTransactionsV1:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: Query old transactions CDC
+      QueryString: !Sub 'select * from "${GlueDatabase}".transactions_v1 limit 10'
+      Name: Blog - Query Old Transactions
+
+  QueryCustomerOrders:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: Query customer orders CDC
+      QueryString:
+        Fn::Sub: |
+          SELECT O.data.id AS orderId,
+                   C.data.id AS customerId,
+                   C.data.name AS customerName,
+                   C.data.country AS customerCountry,
+                   O.data.qty AS qty,
+                   O.data.product.name AS product,
+                   O.data.product.price AS productPrice,
+                   O.data.qty * O.data.product.price AS orderAmount
+          FROM "${GlueDatabase}".customers AS C
+          JOIN "${GlueDatabase}".orders AS O
+              ON C.data.id = O.data.customerId limit 10
+      Name: Blog - Query Customer Orders
+
+Outputs:
+  CuratedBucket:
+    Description: Click here to see output files delivered to the S3 bucket
+    Value:
+      Fn::Sub: https://s3.console.aws.amazon.com/s3/buckets/${CuratedBucket}?region=${AWS::Region}&tab=objects
+  S3BucketCleanup:
+    Description: S3 Output Bucket clean up link
+    Value:
+      Fn::Sub: https://s3.console.aws.amazon.com/s3/bucket/${CuratedBucket}/empty?region=${AWS::Region}
+  PauseDataSource:
+    Description: Pause datasource by disabling event trigger
+    Value:
+      Fn::Sub: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#rules:name=${ScheduledEvent}
+  AthenaQueries:
+    Description: View Athena queries
+    Value:
+      Fn::Sub: https://${AWS::Region}.console.aws.amazon.com/athena/saved-queries/home?force&region=${AWS::Region}
+  TransformerLambdaDeepDive:
+    Description: Click here to see the transformer lambda source code generating table, year, month & day partition keys
+    Value:
+      Fn::Sub: https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${RecordTransformer.Arn}?tab=code
+  FirehoseDeepDive:
+    Description: Click here to see the firehose configuration for version partition key & S3 prefix
+    Value:
+      Fn::Sub: https://${AWS::Region}.console.aws.amazon.com/firehose/home?region=${AWS::Region}#/details/${DeliveryStream}/configuration
